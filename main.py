@@ -24,37 +24,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <title>Turnstile</title>
-</head>
-<body style="margin:0;display:flex;justify-content:center;align-items:center;height:100vh;background:#fafafa;">
-  <div id="cf-turnstile"></div>
   <script>
     window.turnstileToken = "";
     window.turnstileError = "";
-    window.onloadTurnstileCallback = function () {
-      console.log("[Turnstile] onloadTurnstileCallback triggered, calling render");
-      try {
-        turnstile.render("#cf-turnstile", {
-          sitekey: "__SITE_KEY__",
-          callback: function (token) {
-            console.log("[Turnstile] onSuccess called");
-            window.turnstileToken = token;
-          },
-          "error-callback": function (code) {
-            console.error("[Turnstile] onError called:", code);
-            window.turnstileError = String(code);
-          },
-          "expired-callback": function () {
-            window.turnstileToken = "";
-          },
-          theme: "light",
-        });
-      } catch (e) {
-        console.error("[Turnstile] render threw:", e);
-        window.turnstileError = String(e);
-      }
-    };
+    function onSuccess(token) {
+      console.log("[Turnstile] onSuccess called");
+      window.turnstileToken = token;
+    }
+    function onError(code) {
+      console.error("[Turnstile] onError called:", code);
+      window.turnstileError = String(code);
+    }
+    function onExpired() {
+      window.turnstileToken = "";
+    }
   </script>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback&render=explicit" async defer></script>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+</head>
+<body style="margin:0;display:flex;justify-content:center;align-items:center;height:100vh;background:#fafafa;">
+  <div class="cf-turnstile"
+       id="cf-turnstile"
+       data-sitekey="__SITE_KEY__"
+       data-callback="onSuccess"
+       data-error-callback="onError"
+       data-expired-callback="onExpired"></div>
 </body>
 </html>"""
 
@@ -79,6 +72,11 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
+                    "--enable-unsafe-swiftshader",
+                    "--enable-webgl",
+                    "--ignore-gpu-blocklist",
+                    "--use-gl=angle",
+                    "--use-angle=swiftshader",
                     "--no-first-run",
                     "--no-default-browser-check",
                 ],
@@ -119,7 +117,26 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
             eval_res = {}
             max_polls = int(req.timeout_seconds * 2)
             for i in range(max_polls):
+                # Fallback: if turnstile API loaded but hasn't rendered into div, trigger render
+                if i == 3:
+                    await page.evaluate("""() => {
+                        if (window.turnstile && !window.turnstileToken && !window.turnstileManualRendered) {
+                            window.turnstileManualRendered = true;
+                            try {
+                                const el = document.getElementById('cf-turnstile') || document.querySelector('.cf-turnstile');
+                                if (el && !el.shadowRoot) {
+                                    window.turnstile.render(el, {
+                                        sitekey: '__SITE_KEY__',
+                                        callback: function(t) { window.turnstileToken = t; },
+                                        'error-callback': function(e) { window.turnstileError = String(e); }
+                                    });
+                                }
+                            } catch(e) { console.error('[Turnstile] manual render failed:', e); }
+                        }
+                    }""".replace("__SITE_KEY__", req.site_key))
+
                 eval_res = await page.evaluate("""() => {
+                    const el = document.getElementById('cf-turnstile') || document.querySelector('.cf-turnstile');
                     return {
                         token: window.turnstileToken ||
                                document.querySelector('[name="cf-turnstile-response"]')?.value ||
@@ -127,6 +144,7 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                                "",
                         error: window.turnstileError || "",
                         hasTurnstile: typeof window.turnstile !== "undefined",
+                        hasShadow: Boolean(el && el.shadowRoot),
                         iframes: document.querySelectorAll('iframe').length
                     };
                 }""")
@@ -159,10 +177,10 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                                     clicked = True
                                     break
                         if not clicked:
-                            widget = await page.query_selector("#cf-turnstile iframe, iframe, #cf-turnstile")
+                            widget = await page.query_selector(".cf-turnstile, #cf-turnstile")
                             if widget:
                                 box = await widget.bounding_box()
-                                if box:
+                                if box and box["width"] > 0 and box["height"] > 0:
                                     await page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
                                     logger.info(f"Clicked widget at {box['x'] + 30}, {box['y'] + box['height'] / 2}")
                     except Exception as click_err:
@@ -174,10 +192,12 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
             browser = None
 
             if not token:
+                cf_frames = [f.url for f in page.frames if "challenges.cloudflare.com" in f.url]
                 logger.warning(f"Turnstile solve timed out after {time.time() - t0:.2f}s: {eval_res}, console: {console_logs}")
                 raise HTTPException(status_code=504, detail={
                     "message": "Turnstile solve timed out",
                     "state": eval_res,
+                    "cf_frames": len(cf_frames),
                     "console": console_logs[-10:],
                     "failed_requests": failed_requests[-5:],
                 })
