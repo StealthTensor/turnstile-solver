@@ -24,29 +24,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <title>Turnstile</title>
+</head>
+<body style="margin:0;display:flex;justify-content:center;align-items:center;height:100vh;background:#fafafa;">
+  <div id="cf-turnstile"></div>
   <script>
     window.turnstileToken = "";
     window.turnstileError = "";
-    function onSuccess(token) {
-      console.log("[Turnstile] onSuccess called");
-      window.turnstileToken = token;
-    }
-    function onError(code) {
-      console.error("[Turnstile] onError called:", code);
-      window.turnstileError = String(code);
-    }
-    function onExpired() {
-      window.turnstileToken = "";
-    }
+    window.onloadTurnstileCallback = function () {
+      console.log("[Turnstile] onloadTurnstileCallback triggered, calling render");
+      try {
+        turnstile.render("#cf-turnstile", {
+          sitekey: "__SITE_KEY__",
+          callback: function (token) {
+            console.log("[Turnstile] onSuccess called");
+            window.turnstileToken = token;
+          },
+          "error-callback": function (code) {
+            console.error("[Turnstile] onError called:", code);
+            window.turnstileError = String(code);
+          },
+          "expired-callback": function () {
+            window.turnstileToken = "";
+          },
+          theme: "light",
+        });
+      } catch (e) {
+        console.error("[Turnstile] render threw:", e);
+        window.turnstileError = String(e);
+      }
+    };
   </script>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-</head>
-<body style="margin:0;display:flex;justify-content:center;align-items:center;height:100vh;background:#fafafa;">
-  <div class="cf-turnstile"
-       data-sitekey="__SITE_KEY__"
-       data-callback="onSuccess"
-       data-error-callback="onError"
-       data-expired-callback="onExpired"></div>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback&render=explicit" async defer></script>
 </body>
 </html>"""
 
@@ -82,8 +90,11 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
             )
             page = await context.new_page()
 
-            page.on("console", lambda msg: logger.info(f"[browser {msg.type}] {msg.text}"))
-            page.on("pageerror", lambda err: logger.error(f"[browser err] {err}"))
+            console_logs = []
+            failed_requests = []
+            page.on("console", lambda msg: console_logs.append(f"[{msg.type}] {msg.text}"))
+            page.on("pageerror", lambda err: console_logs.append(f"[pageerror] {err}"))
+            page.on("requestfailed", lambda r: failed_requests.append(f"{r.url}: {r.failure}"))
 
             # Intercept genuine domain request, fulfill with local widget under genuine origin
             async def handle_route(route):
@@ -91,7 +102,7 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                     html = HTML_TEMPLATE.replace("__SITE_KEY__", req.site_key)
                     await route.fulfill(
                         status=200,
-                        content_type="text/html",
+                        headers={"content-type": "text/html; charset=utf-8"},
                         body=html,
                     )
                 else:
@@ -115,6 +126,7 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                                document.querySelector('input[name="g-recaptcha-response"]')?.value ||
                                "",
                         error: window.turnstileError || "",
+                        hasTurnstile: typeof window.turnstile !== "undefined",
                         iframes: document.querySelectorAll('iframe').length
                     };
                 }""")
@@ -126,10 +138,13 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                     break
 
                 if err_code:
-                    logger.error(f"Turnstile error callback: {err_code}")
+                    logger.error(f"Turnstile error callback: {err_code}, console: {console_logs}")
                     await browser.close()
                     browser = None
-                    raise HTTPException(status_code=400, detail=f"Turnstile error: {err_code}")
+                    raise HTTPException(status_code=400, detail={
+                        "error": f"Turnstile error: {err_code}",
+                        "console": console_logs[-5:],
+                    })
 
                 # Interactive challenge handling: click checkbox
                 if i in (2, 4, 7, 10, 14):
@@ -144,7 +159,7 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                                     clicked = True
                                     break
                         if not clicked:
-                            widget = await page.query_selector(".cf-turnstile iframe, iframe, .cf-turnstile")
+                            widget = await page.query_selector("#cf-turnstile iframe, iframe, #cf-turnstile")
                             if widget:
                                 box = await widget.bounding_box()
                                 if box:
@@ -159,8 +174,13 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
             browser = None
 
             if not token:
-                logger.warning(f"Turnstile solve timed out after {time.time() - t0:.2f}s: {eval_res}")
-                raise HTTPException(status_code=504, detail=f"Turnstile solve timed out: {eval_res}")
+                logger.warning(f"Turnstile solve timed out after {time.time() - t0:.2f}s: {eval_res}, console: {console_logs}")
+                raise HTTPException(status_code=504, detail={
+                    "message": "Turnstile solve timed out",
+                    "state": eval_res,
+                    "console": console_logs[-10:],
+                    "failed_requests": failed_requests[-5:],
+                })
 
             elapsed = round((time.time() - t0) * 1000)
             logger.info(f"Turnstile solved successfully in {elapsed}ms")
