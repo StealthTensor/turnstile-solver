@@ -27,7 +27,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body style="margin:0;display:flex;justify-content:center;align-items:center;height:100vh;background:#fafafa;">
-  <div class="cf-turnstile" data-sitekey="{site_key}" data-callback="onSuccess"></div>
+  <div class="cf-turnstile" data-sitekey="__SITE_KEY__" data-callback="onSuccess"></div>
   <script>
     window.turnstileToken = "";
     function onSuccess(token) {
@@ -49,6 +49,7 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
     t0 = time.time()
     logger.info(f"Solving Turnstile for {req.site_url} with key {req.site_key[:12]}...")
 
+    browser = None
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -69,19 +70,22 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
             page = await context.new_page()
 
             # Intercept genuine domain request, fulfill with local widget under genuine origin
-            await page.route(
-                req.site_url,
-                lambda r: r.fulfill(
-                    status=200,
-                    content_type="text/html",
-                    body=HTML_TEMPLATE.format(site_key=req.site_key),
-                ),
-            )
+            async def handle_route(route):
+                if route.request.resource_type == "document":
+                    html = HTML_TEMPLATE.replace("__SITE_KEY__", req.site_key)
+                    await route.fulfill(
+                        status=200,
+                        content_type="text/html",
+                        body=html,
+                    )
+                else:
+                    await route.continue_()
+
+            await page.route(f"{req.site_url}*", handle_route)
 
             try:
                 await page.goto(req.site_url, timeout=req.timeout_seconds * 1000)
             except Exception as e:
-                await browser.close()
                 raise HTTPException(status_code=500, detail=f"Navigation failed: {str(e)}")
 
             token = None
@@ -94,7 +98,7 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                 # If interactive challenge, click bounding box of widget
                 if i in (4, 8, 14):
                     try:
-                        widget = await page.query_selector(".cf-turnstile, div[data-sitekey]")
+                        widget = await page.query_selector(".cf-turnstile iframe, iframe, .cf-turnstile")
                         if widget:
                             box = await widget.bounding_box()
                             if box:
@@ -105,6 +109,7 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
                 await asyncio.sleep(0.5)
 
             await browser.close()
+            browser = None
 
             if not token:
                 logger.warning(f"Turnstile solve timed out after {time.time() - t0:.2f}s")
@@ -118,4 +123,10 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
     except Exception as e:
         logger.exception("Solve exception")
         raise HTTPException(status_code=500, detail=f"Solver error: {str(e)}")
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
