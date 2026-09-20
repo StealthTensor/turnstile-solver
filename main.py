@@ -49,66 +49,73 @@ async def solve(req: SolveRequest, x_secret: Optional[str] = Header(default=""))
     t0 = time.time()
     logger.info(f"Solving Turnstile for {req.site_url} with key {req.site_key[:12]}...")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
-        page = await context.new_page()
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+            )
+            page = await context.new_page()
 
-        # Intercept genuine domain request, fulfill with local widget under genuine origin
-        await page.route(
-            req.site_url,
-            lambda r: r.fulfill(
-                status=200,
-                content_type="text/html",
-                body=HTML_TEMPLATE.format(site_key=req.site_key),
-            ),
-        )
+            # Intercept genuine domain request, fulfill with local widget under genuine origin
+            await page.route(
+                req.site_url,
+                lambda r: r.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body=HTML_TEMPLATE.format(site_key=req.site_key),
+                ),
+            )
 
-        try:
-            await page.goto(req.site_url, timeout=req.timeout_seconds * 1000)
-        except Exception as e:
+            try:
+                await page.goto(req.site_url, timeout=req.timeout_seconds * 1000)
+            except Exception as e:
+                await browser.close()
+                raise HTTPException(status_code=500, detail=f"Navigation failed: {str(e)}")
+
+            token = None
+            max_polls = int(req.timeout_seconds * 2)
+            for i in range(max_polls):
+                token = await page.evaluate("window.turnstileToken")
+                if token and len(token) > 20:
+                    break
+
+                # If interactive challenge, click bounding box of widget
+                if i in (4, 8, 14):
+                    try:
+                        widget = await page.query_selector(".cf-turnstile, div[data-sitekey]")
+                        if widget:
+                            box = await widget.bounding_box()
+                            if box:
+                                await page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(0.5)
+
             await browser.close()
-            raise HTTPException(status_code=500, detail=f"Navigation failed: {str(e)}")
 
-        token = None
-        max_polls = int(req.timeout_seconds * 2)
-        for i in range(max_polls):
-            token = await page.evaluate("window.turnstileToken")
-            if token and len(token) > 20:
-                break
+            if not token:
+                logger.warning(f"Turnstile solve timed out after {time.time() - t0:.2f}s")
+                raise HTTPException(status_code=504, detail="Turnstile solve timed out")
 
-            # If interactive challenge, click bounding box of widget
-            if i in (4, 8, 14):
-                try:
-                    widget = await page.query_selector(".cf-turnstile, div[data-sitekey]")
-                    if widget:
-                        box = await widget.bounding_box()
-                        if box:
-                            await page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
-                except Exception:
-                    pass
+            elapsed = round((time.time() - t0) * 1000)
+            logger.info(f"Turnstile solved successfully in {elapsed}ms")
+            return {"ok": True, "token": token, "elapsed_ms": elapsed}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Solve exception")
+        raise HTTPException(status_code=500, detail=f"Solver error: {str(e)}")
 
-            await asyncio.sleep(0.5)
-
-        await browser.close()
-
-        if not token:
-            logger.warning(f"Turnstile solve timed out after {time.time() - t0:.2f}s")
-            raise HTTPException(status_code=504, detail="Turnstile solve timed out")
-
-        elapsed = round((time.time() - t0) * 1000)
-        logger.info(f"Turnstile solved successfully in {elapsed}ms")
-        return {"ok": True, "token": token, "elapsed_ms": elapsed}
