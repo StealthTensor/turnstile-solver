@@ -43,25 +43,3 @@ Solves Cloudflare Turnstile for the given site and key.
   "elapsed_ms": 1820
 }
 ```
-
-## CI/CD and Container Registry
-
-On push to `main`, GitHub Actions automatically builds and publishes the Docker image to GitHub Container Registry:
-`ghcr.io/stealthtensor/turnstile-solver:latest`
-
-## Railway Deployment (Zero GitHub Connection Needed)
-
-1. Go to [Railway Dashboard](https://railway.app/).
-2. Click **+ New Project** $\rightarrow$ **Deploy from Docker Image**.
-3. Enter the image:
-   ```text
-   ghcr.io/stealthtensor/turnstile-solver:latest
-   ```
-4. In Railway project settings:
-   - **Networking**: Click **Generate Domain** (e.g. `https://turnstile-solver-production.up.railway.app`).
-   - **Variables**: Set `SOLVER_SECRET="@Ethical_Hacker1"`.
-   - **Port**: Set `PORT="8080"` (default).
-5. Done! The service is live and ready to be called by `lpu-worker`.
-
-> **Note on GHCR Package Visibility:**  
-> On GitHub: Go to repository **Packages** $\rightarrow$ `turnstile-solver` $\rightarrow$ **Package Settings** $\rightarrow$ change visibility to **Public** so Railway can pull without Docker registry credentials.
