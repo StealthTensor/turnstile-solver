@@ -24,7 +24,7 @@ Solves Cloudflare Turnstile for the given site and key.
 
 **Headers:**
 - `Content-Type: application/json`
-- `X-Secret: @Ethical_Hacker1` (or your configured `SOLVER_SECRET`)
+- `X-Secret: hehehaha` (or your configured `SOLVER_SECRET`)
 
 **Request Body:**
 ```json
